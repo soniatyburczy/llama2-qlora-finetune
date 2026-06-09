@@ -3,7 +3,6 @@ Implementation of a task-specific **QLoRA supervised fine-tuning** pipeline for 
 
 ## Table of Contents
 - [Project Context](#project-context)
-- [Model Access](#model-access)
 - [Model Choice](#model-choice)
 - [Getting Started](#getting-started)
 - [Training Pipeline](#training-pipeline)
@@ -34,11 +33,6 @@ The code in this repository documents the full experimentation pipeline, includi
 
 Although this repository is primarily a research record, all code is fully open and can be adapted or reused for your own fine-tuning experiments.
 Feel free to explore, modify, or extend the pipeline as needed!
-
-## Model Access
-The fine-tuned LoRA adapters are available on Hugging Face:
-
-[![HuggingFace Model](https://img.shields.io/badge/🤗-HuggingFace%20Model-orange.svg)](https://huggingface.co/czszt/llama2-7b-qlora-cover-letter)
 
 ## Model Choice
 **LLaMA-2-7B Chat** was selected as the base model for various reasons.
