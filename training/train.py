@@ -1,4 +1,5 @@
 import re
+import json
 import torch
 from datasets import load_dataset
 from transformers import (
@@ -9,8 +10,7 @@ from transformers import (
     DataCollatorForLanguageModeling,
     BitsAndBytesConfig
 )
-from peft import LoraConfig, get_peft_model
-from huggingface_hub import login
+from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
 
 # Config
 MODEL_NAME = "meta-llama/Llama-2-7b-chat-hf"
@@ -23,12 +23,11 @@ NUM_EPOCHS = 4
 LEARNING_RATE = 2e-4
 USE_CHAT_FORMAT = False
 CLEAN_DATASET = True
+SEED = 316
+VAL_FRACTION = 0.1
 
 # To login:
 # huggingface-cli login
-
-device = "cuda" if torch.cuda.is_available() else "cpu"
-# print(f"Using device: {device}", torch.cuda.get_device_name(0) if torch.cuda.is_available() else "")
 
 # Load tokenizer
 tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, use_fast=False)
@@ -38,23 +37,23 @@ tokenizer.padding_side = "right"
 
 # QLoRA config to reduce memory use
 bnb_config = BitsAndBytesConfig(
-    load_in_8bit=True,
-    bnb_8bit_use_double_quant=True,
-    bnb_8bit_quant_type="nf4",
-    llm_int8_threshold=6.0
+    load_in_4bit=True,
+    bnb_4bit_use_double_quant=True,
+    bnb_4bit_quant_type="nf4",
+    bnb_4bit_compute_dtype=torch.float16
 )
 
-# Load base model in 8-bit
+# Load quantized base 
 model = AutoModelForCausalLM.from_pretrained(
     MODEL_NAME,
     quantization_config=bnb_config,
     device_map="auto",
-    torch_dtype=torch.float16
 )
 
-# Enable memory-efficient training
-model.gradient_checkpointing_enable()
-model.enable_input_require_grads()
+# Prep for k-bit training
+model = prepare_model_for_kbit_training(
+    model, use_gradient_checkpointing=True
+)
 
 # Apply LoRA adapters
 lora_config = LoraConfig(
@@ -67,11 +66,18 @@ lora_config = LoraConfig(
 )
 
 model = get_peft_model(model, lora_config)
-# model.print_trainable_parameters()
+model.print_trainable_parameters()
 
 # Load dataset
-raw_train = load_dataset(f'{DATASET_NAME}', split="train")
-raw_test  = load_dataset(f'{DATASET_NAME}', split="test")
+raw_train_full = load_dataset(DATASET_NAME, split="train")
+raw_test = load_dataset(DATASET_NAME, split="test")
+
+# Split dataset (train/validation/test)
+_split = raw_train_full.train_test_split(test_size=VAL_FRACTION, seed=SEED)
+raw_train = _split["train"]
+raw_val = _split["test"]
+
+print(f"Splits — train: {len(raw_train)}, val: {len(raw_val)}, test: {len(raw_test)}")
 
 # Remove trash 
 def clean_cover_letter(text):
@@ -124,27 +130,53 @@ def format_example(ex):
     prompt = base_prompt + "\n"
     return {"prompt": prompt, "completion": completion}
 
-train_dataset = raw_train.map(format_example, remove_columns=raw_train.column_names)
-test_dataset  = raw_test.map(format_example, remove_columns=raw_test.column_names)
 
-# print(train_dataset[0])
+train_dataset = raw_train.map(format_example, remove_columns=raw_train.column_names)
+val_dataset = raw_val.map(format_example, remove_columns=raw_val.column_names)
+test_dataset = raw_test.map(format_example, remove_columns=raw_test.column_names)
+ 
+# Drop empty completions
+_pre = (len(train_dataset), len(val_dataset), len(test_dataset))
+train_dataset = train_dataset.filter(lambda ex: len(ex["completion"].strip()) > 0)
+val_dataset = val_dataset.filter(lambda ex: len(ex["completion"].strip()) > 0)
+test_dataset = test_dataset.filter(lambda ex: len(ex["completion"].strip()) > 0)
+print(f"Dropped empty completions — train: {_pre[0] - len(train_dataset)}, "
+      f"val: {_pre[1] - len(val_dataset)}, test: {_pre[2] - len(test_dataset)}")
 
 # Tokenization
 def tokenize_fn(ex):
-    text = ex["prompt"] + ex["completion"] + tokenizer.eos_token
-
-    tokens = tokenizer(
-        text,
-        truncation=True,
-        max_length=MAX_LENGTH,
-    )
-
-    tokens["labels"] = tokens["input_ids"].copy()
-    return tokens
-
-
+    prompt_ids = tokenizer(ex["prompt"], add_special_tokens=True)["input_ids"]
+    completion_ids = tokenizer(ex["completion"], add_special_tokens=False)["input_ids"]
+    completion_ids = completion_ids + [tokenizer.eos_token_id]
+ 
+    input_ids = prompt_ids + completion_ids
+    labels = [-100] * len(prompt_ids) + completion_ids.copy()
+ 
+    truncated = len(input_ids) > MAX_LENGTH
+    input_ids = input_ids[:MAX_LENGTH]
+    labels = labels[:MAX_LENGTH]
+ 
+    return {
+        "input_ids": input_ids,
+        "attention_mask": [1] * len(input_ids),
+        "labels": labels,
+        "truncated": truncated,
+    }
+ 
 train_dataset = train_dataset.map(tokenize_fn, remove_columns=["prompt", "completion"])
-test_dataset  = test_dataset.map(tokenize_fn, remove_columns=["prompt", "completion"])
+val_dataset = val_dataset.map(tokenize_fn, remove_columns=["prompt", "completion"])
+test_dataset = test_dataset.map(tokenize_fn, remove_columns=["prompt", "completion"])
+
+# Report truncation for every split
+for name, ds in [("train", train_dataset), ("val", val_dataset), ("test", test_dataset)]:
+    n_trunc = sum(ds["truncated"])
+    print(f"Truncated at {MAX_LENGTH} tokens [{name}]: {n_trunc}/{len(ds)} "
+          f"({100 * n_trunc / len(ds):.1f}%)")
+ 
+# Drop `truncated` before training
+train_dataset = train_dataset.remove_columns("truncated")
+val_dataset = val_dataset.remove_columns("truncated")
+test_dataset = test_dataset.remove_columns("truncated")
 
 # Data collator
 data_collator = DataCollatorForLanguageModeling(
@@ -169,23 +201,32 @@ training_args = TrainingArguments(
     warmup_ratio=0.03,
     report_to="none",
     gradient_checkpointing=True,
+    seed=SEED,
+    data_seed=SEED,
+    lr_scheduler_type="cosine",
+    load_best_model_at_end=True,
+    metric_for_best_model="eval_loss",
+    greater_is_better=False,
 )
 
 # Trainer
 trainer = Trainer(
     model=model,
-    tokenizer=tokenizer,
+    processing_class=tokenizer,
     args=training_args,
     train_dataset=train_dataset,
-    eval_dataset=test_dataset,
+    eval_dataset=val_dataset,
     data_collator=data_collator
 )
 
-print("Starting training...") 
-trainer.train() 
+ 
+print("Starting training...")
+trainer.train()
 
-# Save model
-print("Saving final model...") 
-model.save_pretrained(OUTPUT_DIR, safe_serialization=True) 
-tokenizer.save_pretrained(OUTPUT_DIR) 
+print("Saving final model...")
+trainer.save_model(OUTPUT_DIR)
+tokenizer.save_pretrained(OUTPUT_DIR)
 print("Model saved to:", OUTPUT_DIR)
+ 
+with open(f"{OUTPUT_DIR}/log_history.json", "w") as f:
+    json.dump(trainer.state.log_history, f, indent=2)
