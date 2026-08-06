@@ -1,6 +1,8 @@
 # llama2-qlora-finetune
 Implementation of a task-specific **QLoRA supervised fine-tuning** pipeline for **LLaMA-2-7B-Chat**, developed for an independent study on structured cover letter generation.
 
+**NOTE**: Under renovation. Project is being revisited and updated.
+
 ## Table of Contents
 - [Project Context](#project-context)
 - [Model Choice](#model-choice)
